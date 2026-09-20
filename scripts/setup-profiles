@@ -1,0 +1,19 @@
+#!/bin/sh
+set -eu
+
+repo_dir=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+profile_dir="$repo_dir/.local-secrets/profiles"
+
+umask 077
+mkdir -p "$profile_dir"
+chmod 700 "$repo_dir/.local-secrets" "$profile_dir"
+
+for profile in ds gpt; do
+  destination="$profile_dir/$profile.env"
+  if [ ! -e "$destination" ]; then
+    cp "$repo_dir/config/profiles/$profile.env.example" "$destination"
+  fi
+  chmod 600 "$destination"
+done
+
+echo "Local profiles are ready in $profile_dir"

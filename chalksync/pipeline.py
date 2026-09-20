@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import re
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from .media import extract_frames, link_video, locate_inbox_inputs, locate_video, probe_media
-from .openai_api import OpenAIClient, response_payload, response_text
+from .openai_api import ResponsesAPIError, ResponsesClient, response_payload, response_text
+from .profiles import ModelProfile
 from .prompts import (
     FINAL_DEVELOPER_PROMPT,
     LAYOUT_DEVELOPER_PROMPT,
@@ -30,6 +33,83 @@ from .utils import (
 
 
 COURSE_FILE = "course.json"
+LAYOUT_PROMPT_REVISION = 1
+WORKER_PROMPT_REVISION = 1
+FINAL_PROMPT_REVISION = 1
+
+
+def _fingerprint(value: Any) -> str:
+    encoded = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _file_fingerprint(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _provenance(
+    profile: ModelProfile,
+    *,
+    prompt_revision: int,
+    input_fingerprint: str,
+    operation: str,
+) -> dict[str, Any]:
+    cache_identity = {
+        "profile_fingerprint": profile.fingerprint(operation),
+        "prompt_revision": prompt_revision,
+        "input_fingerprint": input_fingerprint,
+        "operation": operation,
+    }
+    return {
+        "cache_key": _fingerprint(cache_identity),
+        "profile": profile.provenance(operation),
+        "prompt_revision": prompt_revision,
+        "input_fingerprint": input_fingerprint,
+        "operation": operation,
+    }
+
+
+def _require_matching_provenance(
+    actual: dict[str, Any] | None,
+    expected: dict[str, Any],
+    *,
+    artifact: Path,
+) -> None:
+    if not actual or actual.get("cache_key") != expected["cache_key"]:
+        raise RuntimeError(
+            f"Cached artifact provenance does not match the selected profile or current inputs: {artifact}. "
+            "Re-run this stage with --force to regenerate it."
+        )
+
+
+def _request_response(
+    course_dir: Path,
+    *,
+    stage: str,
+    client: ResponsesClient,
+    payload: dict[str, Any],
+) -> dict[str, Any]:
+    try:
+        return client.create_response(payload)
+    except ResponsesAPIError as exc:
+        operation = stage.split(":", 1)[0]
+        if operation in {"final-section", "final-merge"}:
+            operation = "final"
+        write_json(
+            course_dir / "state" / "last_error.json",
+            {
+                "occurred_at": datetime.now(timezone.utc).isoformat(),
+                "stage": stage,
+                "profile": client.profile.provenance(operation),
+                "error_type": type(exc).__name__,
+                "message": getattr(exc, "safe_message", "Responses request failed"),
+            },
+        )
+        raise
 
 
 def init_course(
@@ -114,10 +194,19 @@ def prepare_course(course_dir: Path, *, force: bool = False) -> dict[str, Any]:
     return config
 
 
-def _usage(course_dir: Path, stage: str, model: str, response: dict[str, Any]) -> None:
+def _usage(
+    course_dir: Path, stage: str, profile: ModelProfile, response: dict[str, Any]
+) -> None:
+    operation = stage.split(":", 1)[0]
+    if operation == "final-section" or operation == "final-merge":
+        operation = "final"
     append_jsonl(
         course_dir / "state" / "usage.jsonl",
-        {"stage": stage, "model": model, "usage": response.get("usage", {})},
+        {
+            "stage": stage,
+            "profile": profile.provenance(operation),
+            "usage": response.get("usage", {}),
+        },
     )
 
 
@@ -162,19 +251,35 @@ def _validate_layout(value: dict[str, Any]) -> dict[str, Any]:
 def detect_layout(
     course_dir: Path,
     *,
-    client: OpenAIClient,
-    model: str,
+    client: ResponsesClient,
     force: bool = False,
 ) -> dict[str, Any]:
     course_dir = course_dir.resolve()
     layout_path = course_dir / "visual" / "layout.json"
-    if layout_path.is_file() and not force:
-        return read_json(layout_path)
     config = load_course(course_dir)
     full_index = read_json(course_dir / "media" / "frames" / "full" / "index.json")
     sample_count = int(config["visual"]["layout_sample_frames"])
     samples = choose_evenly(full_index, sample_count)
     image_paths = [course_dir / item["path"] for item in samples]
+    input_fingerprint = _fingerprint(
+        {
+            "samples": samples,
+            "images": [_file_fingerprint(path) for path in image_paths],
+            "image_detail": config["visual"]["image_detail"],
+        }
+    )
+    provenance = _provenance(
+        client.profile,
+        prompt_revision=LAYOUT_PROMPT_REVISION,
+        input_fingerprint=input_fingerprint,
+        operation="layout",
+    )
+    if layout_path.is_file() and not force:
+        existing = read_json(layout_path)
+        _require_matching_provenance(
+            existing.get("provenance"), provenance, artifact=layout_path
+        )
+        return existing
     labels = "\n".join(
         f"Image {index + 1}: video time {item['time']:.3f}s" for index, item in enumerate(samples)
     )
@@ -185,19 +290,23 @@ def detect_layout(
         "Use a full-frame region only when a meaningful split cannot be identified."
     )
     payload = response_payload(
-        model=model,
+        profile=client.profile,
         developer_text=LAYOUT_DEVELOPER_PROMPT,
         user_text=user_text,
         image_paths=image_paths,
         image_detail=config["visual"]["image_detail"],
-        max_output_tokens=2500,
+        max_output_tokens=client.profile.layout_max_output_tokens,
+        structured_output=True,
     )
-    response = client.create_response(payload)
+    response = _request_response(
+        course_dir, stage="layout", client=client, payload=payload
+    )
     layout = _validate_layout(extract_json_object(response_text(response)))
-    layout["model"] = model
+    layout["model"] = client.profile.model
     layout["sample_frames"] = samples
+    layout["provenance"] = provenance
     write_json(layout_path, layout)
-    _usage(course_dir, "layout", model, response)
+    _usage(course_dir, "layout", client.profile, response)
     return layout
 
 
@@ -206,11 +315,32 @@ def extract_region_frames(
 ) -> list[dict[str, Any]]:
     course_dir = course_dir.resolve()
     index_path = course_dir / "visual" / "frames.json"
-    if index_path.is_file() and not force:
-        return read_json(index_path)
+    manifest_path = course_dir / "visual" / "frames.manifest.json"
     config = load_course(course_dir)
-    video = locate_video(course_dir)
     visual = config["visual"]
+    extraction_identity = {
+        "layout": _fingerprint(layout),
+        "region_interval_seconds": visual["region_interval_seconds"],
+        "board_scene_threshold": visual["board_scene_threshold"],
+        "slides_scene_threshold": visual["slides_scene_threshold"],
+        "max_scene_frames": visual["max_scene_frames"],
+        "extraction_version": 1,
+    }
+    expected_fingerprint = _fingerprint(extraction_identity)
+    if index_path.is_file() and not force:
+        if not manifest_path.is_file():
+            raise RuntimeError(
+                f"Cached region frames have no provenance: {manifest_path}. "
+                "Re-run the worker stage with --force."
+            )
+        manifest = read_json(manifest_path)
+        if manifest.get("fingerprint") != expected_fingerprint:
+            raise RuntimeError(
+                f"Cached region frames do not match the current layout: {index_path}. "
+                "Re-run the worker stage with --force."
+            )
+        return read_json(index_path)
+    video = locate_video(course_dir)
     combined: list[dict[str, Any]] = []
     for region in layout["regions"]:
         threshold_key = "board_scene_threshold" if region["kind"] == "board" else "slides_scene_threshold"
@@ -235,6 +365,10 @@ def extract_region_frames(
             )
     combined.sort(key=lambda item: (item["time"], item["region_id"], item["kind"]))
     write_json(index_path, combined)
+    write_json(
+        manifest_path,
+        {"fingerprint": expected_fingerprint, "inputs": extraction_identity},
+    )
     return combined
 
 
@@ -273,17 +407,19 @@ def build_chunks(course_dir: Path) -> list[dict[str, Any]]:
 def ensure_visual_assets(
     course_dir: Path,
     *,
-    client: OpenAIClient,
-    model: str,
+    client: ResponsesClient,
     force: bool = False,
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
-    layout = detect_layout(course_dir, client=client, model=model, force=force)
+    layout = detect_layout(course_dir, client=client, force=force)
     frames = extract_region_frames(course_dir, layout, force=force)
     return layout, frames
 
 
 def _worker_payload(
-    course_dir: Path, config: dict[str, Any], chunk: dict[str, Any], model: str
+    course_dir: Path,
+    config: dict[str, Any],
+    chunk: dict[str, Any],
+    profile: ModelProfile,
 ) -> dict[str, Any]:
     frame_labels = "\n".join(
         f"Image {index + 1}: [{_time_label(frame['time'])}] "
@@ -298,12 +434,13 @@ def _worker_payload(
         f"Timestamped transcript:\n{chunk['transcript'] or '(no speech transcript in this chunk)'}"
     )
     return response_payload(
-        model=model,
+        profile=profile,
         developer_text=WORKER_DEVELOPER_PROMPT,
         user_text=user_text,
         image_paths=[course_dir / frame["path"] for frame in chunk["frames"]],
         image_detail=config["visual"]["image_detail"],
-        max_output_tokens=5000,
+        max_output_tokens=profile.worker_max_output_tokens,
+        structured_output=True,
     )
 
 
@@ -316,22 +453,45 @@ def _time_label(seconds: float) -> str:
 def run_workers_sync(
     course_dir: Path,
     *,
-    client: OpenAIClient,
-    model: str,
+    client: ResponsesClient,
     force: bool = False,
 ) -> list[Path]:
     course_dir = course_dir.resolve()
     config = load_course(course_dir)
-    ensure_visual_assets(course_dir, client=client, model=model, force=force)
+    ensure_visual_assets(course_dir, client=client, force=force)
     chunks = build_chunks(course_dir)
     output_dir = ensure_dir(course_dir / "worker")
     outputs: list[Path] = []
     for chunk in chunks:
         output_path = output_dir / f"{chunk['id']}.json"
         outputs.append(output_path)
+        input_fingerprint = _fingerprint(
+            {
+                "chunk": chunk,
+                "images": [
+                    _file_fingerprint(course_dir / frame["path"])
+                    for frame in chunk["frames"]
+                ],
+            }
+        )
+        provenance = _provenance(
+            client.profile,
+            prompt_revision=WORKER_PROMPT_REVISION,
+            input_fingerprint=input_fingerprint,
+            operation="worker",
+        )
         if output_path.is_file() and not force:
+            existing = read_json(output_path)
+            _require_matching_provenance(
+                existing.get("provenance"), provenance, artifact=output_path
+            )
             continue
-        response = client.create_response(_worker_payload(course_dir, config, chunk, model))
+        response = _request_response(
+            course_dir,
+            stage=f"worker:{chunk['id']}",
+            client=client,
+            payload=_worker_payload(course_dir, config, chunk, client.profile),
+        )
         raw = response_text(response)
         try:
             analysis = extract_json_object(raw)
@@ -345,21 +505,22 @@ def run_workers_sync(
                 "chunk_id": chunk["id"],
                 "start": chunk["start"],
                 "end": chunk["end"],
-                "model": model,
+                "model": client.profile.model,
+                "provenance": provenance,
                 "analysis": analysis,
             },
         )
-        _usage(course_dir, f"worker:{chunk['id']}", model, response)
+        _usage(course_dir, f"worker:{chunk['id']}", client.profile, response)
     return outputs
 
 
 def submit_worker_batch(
     course_dir: Path,
     *,
-    client: OpenAIClient,
-    model: str,
+    client: ResponsesClient,
     force: bool = False,
 ) -> dict[str, Any]:
+    client.require_batch()
     course_dir = course_dir.resolve()
     state_path = course_dir / "state" / "worker_batch.json"
     if state_path.is_file() and not force:
@@ -369,15 +530,31 @@ def submit_worker_batch(
             f"status {existing.get('status')}); collect it or pass --force to submit a replacement"
         )
     config = load_course(course_dir)
-    ensure_visual_assets(course_dir, client=client, model=model, force=force)
+    ensure_visual_assets(course_dir, client=client, force=force)
     chunks = build_chunks(course_dir)
+    request_fingerprint = _fingerprint(
+        {
+            "chunks": chunks,
+            "images": [
+                _file_fingerprint(course_dir / frame["path"])
+                for chunk in chunks
+                for frame in chunk["frames"]
+            ],
+        }
+    )
+    provenance = _provenance(
+        client.profile,
+        prompt_revision=WORKER_PROMPT_REVISION,
+        input_fingerprint=request_fingerprint,
+        operation="worker-batch",
+    )
     input_path = course_dir / "state" / "worker_batch_input.jsonl"
     rows = [
         {
             "custom_id": chunk["id"],
             "method": "POST",
             "url": "/v1/responses",
-            "body": _worker_payload(course_dir, config, chunk, model),
+            "body": _worker_payload(course_dir, config, chunk, client.profile),
         }
         for chunk in chunks
     ]
@@ -388,17 +565,25 @@ def submit_worker_batch(
         "batch_id": batch["id"],
         "input_file_id": uploaded["id"],
         "status": batch.get("status"),
-        "model": model,
+        "model": client.profile.model,
+        "profile_name": client.profile.name,
+        "provenance": provenance,
         "chunks": len(chunks),
     }
     write_json(state_path, state)
     return state
 
 
-def collect_worker_batch(course_dir: Path, *, client: OpenAIClient) -> dict[str, Any]:
+def collect_worker_batch(course_dir: Path, *, client: ResponsesClient) -> dict[str, Any]:
     course_dir = course_dir.resolve()
     state_path = course_dir / "state" / "worker_batch.json"
     state = read_json(state_path)
+    state_profile = (state.get("provenance") or {}).get("profile") or {}
+    if state_profile.get("fingerprint") != client.profile.fingerprint("worker-batch"):
+        raise RuntimeError(
+            f"Batch state at {state_path} belongs to a different profile; "
+            "collect it with the profile used to submit it."
+        )
     if state.get("collected"):
         return state
     batch = client.get_batch(state["batch_id"])
@@ -430,6 +615,21 @@ def collect_worker_batch(course_dir: Path, *, client: OpenAIClient) -> dict[str,
         response = response_wrapper.get("body") or {}
         analysis = extract_json_object(response_text(response))
         chunk = chunks[chunk_id]
+        input_fingerprint = _fingerprint(
+            {
+                "chunk": chunk,
+                "images": [
+                    _file_fingerprint(course_dir / frame["path"])
+                    for frame in chunk["frames"]
+                ],
+            }
+        )
+        provenance = _provenance(
+            client.profile,
+            prompt_revision=WORKER_PROMPT_REVISION,
+            input_fingerprint=input_fingerprint,
+            operation="worker",
+        )
         write_json(
             output_dir / f"{chunk_id}.json",
             {
@@ -437,10 +637,11 @@ def collect_worker_batch(course_dir: Path, *, client: OpenAIClient) -> dict[str,
                 "start": chunk["start"],
                 "end": chunk["end"],
                 "model": state["model"],
+                "provenance": provenance,
                 "analysis": analysis,
             },
         )
-        _usage(course_dir, f"worker:{chunk_id}:batch", state["model"], response)
+        _usage(course_dir, f"worker:{chunk_id}:batch", client.profile, response)
     if failures:
         raise RuntimeError(f"Batch completed with failed chunks: {', '.join(failures)}")
     state["collected"] = True
@@ -463,6 +664,7 @@ def _final_bundles(course_dir: Path) -> list[str]:
             "chunk_id": chunk["id"],
             "range": [chunk["start_label"], chunk["end_label"]],
             "transcript": chunk["transcript"],
+            "worker_provenance": worker.get("provenance"),
             "worker_analysis": worker["analysis"],
         }
         bundles.append(json.dumps(bundle, ensure_ascii=False, indent=2))
@@ -490,8 +692,7 @@ def _group_bundles(bundles: list[str], character_limit: int) -> list[list[str]]:
 def finalize_course(
     course_dir: Path,
     *,
-    client: OpenAIClient,
-    model: str,
+    client: ResponsesClient,
     web_video_url: str | None = None,
     max_source_characters: int = 120_000,
     force: bool = False,
@@ -505,7 +706,28 @@ def finalize_course(
         _save_course(course_dir, config)
     configured_web_url = config.get("web_video_url")
     timestamp_parameter = str(config.get("web_timestamp_parameter") or "t")
+    bundles = _final_bundles(course_dir)
+    groups = _group_bundles(bundles, max_source_characters)
+    input_fingerprint = _fingerprint(
+        {
+            "title": config["title"],
+            "output_language": config["output_language"],
+            "bundles": bundles,
+            "max_source_characters": max_source_characters,
+        }
+    )
+    provenance = _provenance(
+        client.profile,
+        prompt_revision=FINAL_PROMPT_REVISION,
+        input_fingerprint=input_fingerprint,
+        operation="final",
+    )
     if notes_path.is_file() and not force:
+        manifest_path = course_dir / "notes" / "manifest.json"
+        manifest = read_json(manifest_path) if manifest_path.is_file() else {}
+        _require_matching_provenance(
+            manifest.get("provenance"), provenance, artifact=notes_path
+        )
         if configured_web_url:
             existing = notes_path.read_text(encoding="utf-8")
             linked, link_count = link_markdown_timestamps(
@@ -514,8 +736,6 @@ def finalize_course(
                 query_parameter=timestamp_parameter,
             )
             notes_path.write_text(linked.rstrip() + "\n", encoding="utf-8")
-            manifest_path = course_dir / "notes" / "manifest.json"
-            manifest = read_json(manifest_path) if manifest_path.is_file() else {}
             manifest.update(
                 {
                     "web_video_url": configured_web_url,
@@ -525,8 +745,10 @@ def finalize_course(
             )
             write_json(manifest_path, manifest)
         return notes_path
-    groups = _group_bundles(_final_bundles(course_dir), max_source_characters)
-    ensure_dir(course_dir / "notes" / "sections")
+    sections_dir = ensure_dir(course_dir / "notes" / "sections")
+    if force:
+        for section_path in sections_dir.glob("section-*.md"):
+            section_path.unlink()
     if len(groups) == 1:
         user_text = (
             f"Course title: {config['title']}\n"
@@ -534,16 +756,19 @@ def finalize_course(
             "Create the complete study guide from these evidence bundles:\n\n"
             + "\n\n".join(groups[0])
         )
-        response = client.create_response(
-            response_payload(
-                model=model,
+        response = _request_response(
+            course_dir,
+            stage="final",
+            client=client,
+            payload=response_payload(
+                profile=client.profile,
                 developer_text=FINAL_DEVELOPER_PROMPT,
                 user_text=user_text,
-                max_output_tokens=20_000,
-            )
+                max_output_tokens=client.profile.final_max_output_tokens,
+            ),
         )
         markdown = response_text(response)
-        _usage(course_dir, "final", model, response)
+        _usage(course_dir, "final", client.profile, response)
     else:
         section_texts: list[str] = []
         for index, group in enumerate(groups, 1):
@@ -553,34 +778,40 @@ def finalize_course(
                 f"This is evidence group {index} of {len(groups)}.\n\n"
                 + "\n\n".join(group)
             )
-            response = client.create_response(
-                response_payload(
-                    model=model,
+            response = _request_response(
+                course_dir,
+                stage=f"final-section:{index}",
+                client=client,
+                payload=response_payload(
+                    profile=client.profile,
                     developer_text=SECTION_DEVELOPER_PROMPT,
                     user_text=user_text,
-                    max_output_tokens=12_000,
-                )
+                    max_output_tokens=client.profile.final_max_output_tokens,
+                ),
             )
             section = response_text(response)
             section_path = course_dir / "notes" / "sections" / f"section-{index:03d}.md"
             section_path.write_text(section.rstrip() + "\n", encoding="utf-8")
             section_texts.append(section)
-            _usage(course_dir, f"final-section:{index}", model, response)
+            _usage(course_dir, f"final-section:{index}", client.profile, response)
         merge_text = (
             f"Course title: {config['title']}\n"
             f"Output language: {config['output_language']}\n\n"
             + "\n\n---\n\n".join(section_texts)
         )
-        response = client.create_response(
-            response_payload(
-                model=model,
+        response = _request_response(
+            course_dir,
+            stage="final-merge",
+            client=client,
+            payload=response_payload(
+                profile=client.profile,
                 developer_text=MERGE_DEVELOPER_PROMPT,
                 user_text=merge_text,
-                max_output_tokens=20_000,
-            )
+                max_output_tokens=client.profile.final_max_output_tokens,
+            ),
         )
         markdown = response_text(response)
-        _usage(course_dir, "final-merge", model, response)
+        _usage(course_dir, "final-merge", client.profile, response)
     link_count = 0
     if configured_web_url:
         markdown, link_count = link_markdown_timestamps(
@@ -593,7 +824,8 @@ def finalize_course(
     write_json(
         course_dir / "notes" / "manifest.json",
         {
-            "model": model,
+            "model": client.profile.model,
+            "provenance": provenance,
             "groups": len(groups),
             "source_bundles": sum(len(group) for group in groups),
             "web_video_url": configured_web_url,

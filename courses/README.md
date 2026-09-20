@@ -23,7 +23,7 @@
 处理单门课程：
 
 ```bash
-./scripts/chalksync prepare courses/<课程目录>
-./scripts/chalksync worker courses/<课程目录> --mode sync
-./scripts/chalksync finalize courses/<课程目录>
+./scripts/chalksync-profile prepare courses/<课程目录>
+./scripts/chalksync-profile worker courses/<课程目录> --profile ds --mode sync
+./scripts/chalksync-profile finalize courses/<课程目录> --profile gpt
 ```

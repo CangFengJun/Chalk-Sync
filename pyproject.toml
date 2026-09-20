@@ -6,11 +6,11 @@ build-backend = "setuptools.build_meta"
 name = "chalksync"
 version = "0.1.0"
 description = "Local-first video course ingestion and two-stage note generation"
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 dependencies = []
 
 [project.scripts]
-chalksync = "chalksync.cli:main"
+chalksync-profile = "chalksync.cli:main"
 
 [tool.setuptools.packages.find]
 include = ["chalksync*"]

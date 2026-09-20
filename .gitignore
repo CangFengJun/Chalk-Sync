@@ -2,6 +2,7 @@ __pycache__/
 *.py[cod]
 .DS_Store
 .venv/
+/.local-secrets/
 courses/*/inbox/*
 !courses/*/inbox/.gitkeep
 courses/*/media/

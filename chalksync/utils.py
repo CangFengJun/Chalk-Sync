@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import os
 import re
 import subprocess
 from pathlib import Path
@@ -157,13 +156,3 @@ def extract_json_object(text: str) -> dict[str, Any]:
         if isinstance(value, dict):
             return value
     raise ValueError("Model response did not contain a JSON object")
-
-
-def model_from_argument(value: str | None, environment_name: str) -> str:
-    model = value or os.environ.get(environment_name)
-    if not model:
-        raise ValueError(
-            f"No model configured. Pass --model or set {environment_name}; "
-            "the pipeline does not choose models automatically."
-        )
-    return model
