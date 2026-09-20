@@ -1,0 +1,24 @@
+{
+  "schema_version": 1,
+  "series": "2026 南京大学《生成式软件工程》",
+  "lesson_number": 4,
+  "release_date": "2026-09-15",
+  "video_duration_hint": "01:38:30",
+  "title": "软件仓库管理 (2) [04-Raw/26生成式软件工程/NJU]",
+  "language": "zh-CN",
+  "output_language": "zh-CN",
+  "web_video_url": null,
+  "web_timestamp_parameter": "t",
+  "chunk_seconds": 300,
+  "visual": {
+    "layout_sample_frames": 6,
+    "full_frame_interval_seconds": 60,
+    "region_interval_seconds": 30,
+    "full_scene_threshold": 0.18,
+    "board_scene_threshold": 0.025,
+    "slides_scene_threshold": 0.08,
+    "max_scene_frames": 240,
+    "max_frames_per_chunk": 6,
+    "image_detail": "high"
+  }
+}

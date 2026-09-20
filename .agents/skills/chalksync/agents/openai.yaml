@@ -1,0 +1,6 @@
+interface:
+  display_name: "ChalkSync"
+  short_description: "Turn lecture videos into evidence-linked study notes"
+  default_prompt: "Use $chalksync to turn this course video into timestamped notes and review material."
+policy:
+  allow_implicit_invocation: true

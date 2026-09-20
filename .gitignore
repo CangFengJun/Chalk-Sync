@@ -1,0 +1,14 @@
+__pycache__/
+*.py[cod]
+.DS_Store
+.venv/
+courses/*/inbox/*
+!courses/*/inbox/.gitkeep
+courses/*/media/
+courses/*/transcript/
+courses/*/visual/
+courses/*/chunks/
+courses/*/worker/
+courses/*/state/
+courses/*/notes/
+courses/*/viewer/
