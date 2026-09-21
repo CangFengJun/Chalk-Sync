@@ -4,6 +4,12 @@
 
 ChalkSync is a local-first pipeline that turns a lecture video and timestamp-prefixed Markdown subtitles into evidence-linked course notes. A Worker Stage extracts structured transcript and board/slide evidence; a Final Stage verifies it and writes the study guide.
 
+## Why ChalkSync
+
+ChalkSync began as a Vibe Learning workflow for studying Professor Yanyan Jiang's *Generative Software Engineering* course at Nanjing University. The lectures combine spoken explanations, evolving blackboard work, and projected slides, so a transcript-only summary loses important context. That origin explains the preconfigured 2026 course catalog in `courses/`, as well as the emphasis on board/slide recognition and timestamped evidence links.
+
+The pipeline itself is course-agnostic: any lecture with a local video and timestamp-prefixed Markdown subtitles can use the same workflow.
+
 ## Setup
 
 Requirements: Python 3.10+, `ffmpeg`, and `ffprobe`.
@@ -55,6 +61,8 @@ Create a course, then place exactly one supported video and one timestamped Mark
 ```bash
 ./scripts/chalksync-profile init courses/prompt-engineering --title "Prompt Engineering"
 ```
+
+The two input filenames are arbitrary and do not need matching stems or any relationship to the course title. For example, `lecture.mp4` and `subtitles.md` are valid together. The course title is set only by `--title`. The video extension must be `.mp4`, `.mkv`, `.webm`, `.mov`, or `.m4v`; the subtitle extension must be `.md`.
 
 Run the default `ds/gpt` pipeline:
 
