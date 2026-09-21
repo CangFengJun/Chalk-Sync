@@ -29,6 +29,10 @@ def _client(profile_name: str) -> ResponsesClient:
     return ResponsesClient(load_profile(profile_name))
 
 
+def _print_progress(message: str) -> None:
+    print(message, flush=True)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="chalksync-profile")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -103,6 +107,7 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--worker", choices=PROFILE_NAMES, default="ds")
     run.add_argument("--final", choices=PROFILE_NAMES, default="gpt")
     run.add_argument("--web-video-url", help="Public video page used for timestamp links")
+    run.add_argument("--max-source-characters", type=int, default=120_000)
     run.add_argument("--cleanup", action="store_true")
     run.add_argument(
         "--delete-video", action="store_true", help="With --cleanup, permanently delete the inbox video"
@@ -195,7 +200,9 @@ def main(argv: list[str] | None = None) -> None:
             )
             return
         if args.command == "prepare":
-            config = prepare_course(_course(args.course_dir), force=args.force)
+            config = prepare_course(
+                _course(args.course_dir), force=args.force, progress=_print_progress
+            )
             print(
                 f"Prepared {config['title']}: {config['transcript']['segments']} subtitle segments, "
                 f"{config['visual']['full_frames']} full frames"
@@ -205,10 +212,14 @@ def main(argv: list[str] | None = None) -> None:
             course_dir = _course(args.course_dir)
             client = _client(args.profile)
             if args.mode == "sync":
-                outputs = run_workers_sync(course_dir, client=client, force=args.force)
+                outputs = run_workers_sync(
+                    course_dir, client=client, force=args.force, progress=_print_progress
+                )
                 print(f"Worker stage complete: {len(outputs)} chunks")
             else:
-                state = submit_worker_batch(course_dir, client=client, force=args.force)
+                state = submit_worker_batch(
+                    course_dir, client=client, force=args.force, progress=_print_progress
+                )
                 print(f"Batch submitted: {state['batch_id']} ({state['status']})")
             return
         if args.command == "collect":
@@ -224,6 +235,7 @@ def main(argv: list[str] | None = None) -> None:
                 web_video_url=args.web_video_url,
                 max_source_characters=args.max_source_characters,
                 force=args.force,
+                progress=_print_progress,
             )
             print(f"Notes written: {path}")
             return
@@ -253,13 +265,17 @@ def main(argv: list[str] | None = None) -> None:
             course_dir = _course(args.course_dir)
             worker_client = _client(args.worker)
             final_client = _client(args.final)
-            prepare_course(course_dir, force=args.force)
-            run_workers_sync(course_dir, client=worker_client, force=args.force)
+            prepare_course(course_dir, force=args.force, progress=_print_progress)
+            run_workers_sync(
+                course_dir, client=worker_client, force=args.force, progress=_print_progress
+            )
             finalize_course(
                 course_dir,
                 client=final_client,
                 web_video_url=args.web_video_url,
+                max_source_characters=args.max_source_characters,
                 force=args.force,
+                progress=_print_progress,
             )
             if args.cleanup:
                 report = cleanup_course(

@@ -3,9 +3,10 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from .media import extract_frames, link_video, locate_inbox_inputs, locate_video, probe_media
 from .openai_api import ResponsesAPIError, ResponsesClient, response_payload, response_text
@@ -36,6 +37,19 @@ COURSE_FILE = "course.json"
 LAYOUT_PROMPT_REVISION = 1
 WORKER_PROMPT_REVISION = 1
 FINAL_PROMPT_REVISION = 1
+ProgressCallback = Callable[[str], None]
+
+
+def _notify(progress: ProgressCallback | None, message: str) -> None:
+    if progress:
+        progress(message)
+
+
+def _profile_label(profile: ModelProfile) -> str:
+    provider = {"deepseek": "DeepSeek", "gpt": "GPT"}.get(
+        profile.provider.lower(), profile.provider
+    )
+    return f"{provider} ({profile.model})"
 
 
 def _fingerprint(value: Any) -> str:
@@ -159,9 +173,15 @@ def _save_course(course_dir: Path, config: dict[str, Any]) -> None:
     write_json(course_dir.resolve() / COURSE_FILE, config)
 
 
-def prepare_course(course_dir: Path, *, force: bool = False) -> dict[str, Any]:
+def prepare_course(
+    course_dir: Path,
+    *,
+    force: bool = False,
+    progress: ProgressCallback | None = None,
+) -> dict[str, Any]:
     course_dir = course_dir.resolve()
     config = load_course(course_dir)
+    _notify(progress, "[prepare] 正在检查视频和字幕...")
     inbox_video, inbox_subtitle = locate_inbox_inputs(course_dir)
     video = link_video(course_dir, inbox_video, force=force)
     media_info = probe_media(video)
@@ -171,8 +191,10 @@ def prepare_course(course_dir: Path, *, force: bool = False) -> dict[str, Any]:
         transcript_path,
         video_duration=media_info["duration"],
     )
+    _notify(progress, f"[prepare] 解析字幕完成：{len(segments)} 条")
 
     visual = config["visual"]
+    _notify(progress, "[frames] 正在抽取全画面候选帧...")
     full_frames = extract_frames(
         video,
         course_dir / "media" / "frames" / "full",
@@ -182,6 +204,7 @@ def prepare_course(course_dir: Path, *, force: bool = False) -> dict[str, Any]:
         force=force,
         relative_root=course_dir,
     )
+    _notify(progress, f"[frames] 全画面抽帧完成：{len(full_frames)} 张")
     config["media"] = media_info
     config["media"]["course_video"] = str(video.relative_to(course_dir))
     config["transcript"] = {
@@ -253,6 +276,7 @@ def detect_layout(
     *,
     client: ResponsesClient,
     force: bool = False,
+    progress: ProgressCallback | None = None,
 ) -> dict[str, Any]:
     course_dir = course_dir.resolve()
     layout_path = course_dir / "visual" / "layout.json"
@@ -279,6 +303,7 @@ def detect_layout(
         _require_matching_provenance(
             existing.get("provenance"), provenance, artifact=layout_path
         )
+        _notify(progress, f"[layout] 使用已有布局：{len(existing['regions'])} 个区域")
         return existing
     labels = "\n".join(
         f"Image {index + 1}: video time {item['time']:.3f}s" for index, item in enumerate(samples)
@@ -298,6 +323,8 @@ def detect_layout(
         max_output_tokens=client.profile.layout_max_output_tokens,
         structured_output=True,
     )
+    _notify(progress, f"[layout] 等待 {_profile_label(client.profile)} 识别板书/PPT 区域...")
+    started = time.monotonic()
     response = _request_response(
         course_dir, stage="layout", client=client, payload=payload
     )
@@ -307,11 +334,19 @@ def detect_layout(
     layout["provenance"] = provenance
     write_json(layout_path, layout)
     _usage(course_dir, "layout", client.profile, response)
+    _notify(
+        progress,
+        f"[layout] 识别完成：{len(layout['regions'])} 个区域，用时 {time.monotonic() - started:.1f} 秒",
+    )
     return layout
 
 
 def extract_region_frames(
-    course_dir: Path, layout: dict[str, Any], *, force: bool = False
+    course_dir: Path,
+    layout: dict[str, Any],
+    *,
+    force: bool = False,
+    progress: ProgressCallback | None = None,
 ) -> list[dict[str, Any]]:
     course_dir = course_dir.resolve()
     index_path = course_dir / "visual" / "frames.json"
@@ -339,11 +374,20 @@ def extract_region_frames(
                 f"Cached region frames do not match the current layout: {index_path}. "
                 "Re-run the worker stage with --force."
             )
-        return read_json(index_path)
+        existing = read_json(index_path)
+        _notify(progress, f"[frames] 使用已有区域帧：{len(existing)} 张")
+        return existing
     video = locate_video(course_dir)
     combined: list[dict[str, Any]] = []
     for region in layout["regions"]:
         threshold_key = "board_scene_threshold" if region["kind"] == "board" else "slides_scene_threshold"
+        kind_label = {
+            "board": "板书",
+            "slides": "PPT",
+            "screen": "屏幕",
+            "other": "画面",
+        }.get(region["kind"], region["kind"])
+        _notify(progress, f"[frames] 正在分析 {kind_label} 区域：{region['label']}...")
         frames = extract_frames(
             video,
             course_dir / "media" / "frames" / "regions" / region["id"],
@@ -354,6 +398,7 @@ def extract_region_frames(
             crop=region,
             relative_root=course_dir,
         )
+        _notify(progress, f"[frames] {kind_label} 区域完成：{len(frames)} 张")
         for frame in frames:
             combined.append(
                 {
@@ -369,6 +414,7 @@ def extract_region_frames(
         manifest_path,
         {"fingerprint": expected_fingerprint, "inputs": extraction_identity},
     )
+    _notify(progress, f"[frames] 区域抽帧完成：{len(combined)} 张")
     return combined
 
 
@@ -409,9 +455,10 @@ def ensure_visual_assets(
     *,
     client: ResponsesClient,
     force: bool = False,
+    progress: ProgressCallback | None = None,
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
-    layout = detect_layout(course_dir, client=client, force=force)
-    frames = extract_region_frames(course_dir, layout, force=force)
+    layout = detect_layout(course_dir, client=client, force=force, progress=progress)
+    frames = extract_region_frames(course_dir, layout, force=force, progress=progress)
     return layout, frames
 
 
@@ -455,14 +502,17 @@ def run_workers_sync(
     *,
     client: ResponsesClient,
     force: bool = False,
+    progress: ProgressCallback | None = None,
 ) -> list[Path]:
     course_dir = course_dir.resolve()
     config = load_course(course_dir)
-    ensure_visual_assets(course_dir, client=client, force=force)
+    ensure_visual_assets(course_dir, client=client, force=force, progress=progress)
     chunks = build_chunks(course_dir)
+    total = len(chunks)
+    _notify(progress, f"[worker] 共 {total} 个分块，使用 {_profile_label(client.profile)}")
     output_dir = ensure_dir(course_dir / "worker")
     outputs: list[Path] = []
-    for chunk in chunks:
+    for index, chunk in enumerate(chunks, 1):
         output_path = output_dir / f"{chunk['id']}.json"
         outputs.append(output_path)
         input_fingerprint = _fingerprint(
@@ -485,7 +535,10 @@ def run_workers_sync(
             _require_matching_provenance(
                 existing.get("provenance"), provenance, artifact=output_path
             )
+            _notify(progress, f"[worker] {index}/{total} 使用已有结果")
             continue
+        _notify(progress, f"[worker] {index}/{total} 等待 {_profile_label(client.profile)} 响应...")
+        started = time.monotonic()
         response = _request_response(
             course_dir,
             stage=f"worker:{chunk['id']}",
@@ -511,6 +564,11 @@ def run_workers_sync(
             },
         )
         _usage(course_dir, f"worker:{chunk['id']}", client.profile, response)
+        _notify(
+            progress,
+            f"[worker] {index}/{total} 完成，用时 {time.monotonic() - started:.1f} 秒",
+        )
+    _notify(progress, f"[worker] 全部完成：{total}/{total}")
     return outputs
 
 
@@ -519,6 +577,7 @@ def submit_worker_batch(
     *,
     client: ResponsesClient,
     force: bool = False,
+    progress: ProgressCallback | None = None,
 ) -> dict[str, Any]:
     client.require_batch()
     course_dir = course_dir.resolve()
@@ -530,7 +589,7 @@ def submit_worker_batch(
             f"status {existing.get('status')}); collect it or pass --force to submit a replacement"
         )
     config = load_course(course_dir)
-    ensure_visual_assets(course_dir, client=client, force=force)
+    ensure_visual_assets(course_dir, client=client, force=force, progress=progress)
     chunks = build_chunks(course_dir)
     request_fingerprint = _fingerprint(
         {
@@ -696,6 +755,7 @@ def finalize_course(
     web_video_url: str | None = None,
     max_source_characters: int = 120_000,
     force: bool = False,
+    progress: ProgressCallback | None = None,
 ) -> Path:
     course_dir = course_dir.resolve()
     notes_path = course_dir / "notes" / "course.md"
@@ -708,6 +768,7 @@ def finalize_course(
     timestamp_parameter = str(config.get("web_timestamp_parameter") or "t")
     bundles = _final_bundles(course_dir)
     groups = _group_bundles(bundles, max_source_characters)
+    _notify(progress, f"[final] 已汇总 {len(bundles)} 个 Worker 分块")
     input_fingerprint = _fingerprint(
         {
             "title": config["title"],
@@ -744,11 +805,13 @@ def finalize_course(
                 }
             )
             write_json(manifest_path, manifest)
+        _notify(progress, "[final] 使用已有最终笔记")
         return notes_path
     sections_dir = ensure_dir(course_dir / "notes" / "sections")
     if force:
-        for section_path in sections_dir.glob("section-*.md"):
-            section_path.unlink()
+        for section_artifact in sections_dir.glob("section-*"):
+            if section_artifact.is_file():
+                section_artifact.unlink()
     if len(groups) == 1:
         user_text = (
             f"Course title: {config['title']}\n"
@@ -756,6 +819,8 @@ def finalize_course(
             "Create the complete study guide from these evidence bundles:\n\n"
             + "\n\n".join(groups[0])
         )
+        _notify(progress, f"[final] 等待 {_profile_label(client.profile)} 生成最终笔记...")
+        started = time.monotonic()
         response = _request_response(
             course_dir,
             stage="final",
@@ -769,15 +834,47 @@ def finalize_course(
         )
         markdown = response_text(response)
         _usage(course_dir, "final", client.profile, response)
+        _notify(progress, f"[final] 生成完成，用时 {time.monotonic() - started:.1f} 秒")
     else:
         section_texts: list[str] = []
         for index, group in enumerate(groups, 1):
+            section_path = sections_dir / f"section-{index:03d}.md"
+            section_manifest_path = sections_dir / f"section-{index:03d}.manifest.json"
+            section_provenance = _provenance(
+                client.profile,
+                prompt_revision=FINAL_PROMPT_REVISION,
+                input_fingerprint=_fingerprint(
+                    {
+                        "title": config["title"],
+                        "output_language": config["output_language"],
+                        "group_index": index,
+                        "group_count": len(groups),
+                        "group": group,
+                    }
+                ),
+                operation="final",
+            )
+            if section_path.is_file() and section_manifest_path.is_file() and not force:
+                section_manifest = read_json(section_manifest_path)
+                _require_matching_provenance(
+                    section_manifest.get("provenance"),
+                    section_provenance,
+                    artifact=section_path,
+                )
+                section_texts.append(section_path.read_text(encoding="utf-8").rstrip())
+                _notify(progress, f"[final] 分段 {index}/{len(groups)} 使用已有结果")
+                continue
             user_text = (
                 f"Course title: {config['title']}\n"
                 f"Output language: {config['output_language']}\n"
                 f"This is evidence group {index} of {len(groups)}.\n\n"
                 + "\n\n".join(group)
             )
+            _notify(
+                progress,
+                f"[final] 分段 {index}/{len(groups)} 等待 {_profile_label(client.profile)} 响应...",
+            )
+            started = time.monotonic()
             response = _request_response(
                 course_dir,
                 stage=f"final-section:{index}",
@@ -790,15 +887,30 @@ def finalize_course(
                 ),
             )
             section = response_text(response)
-            section_path = course_dir / "notes" / "sections" / f"section-{index:03d}.md"
             section_path.write_text(section.rstrip() + "\n", encoding="utf-8")
+            write_json(
+                section_manifest_path,
+                {
+                    "model": client.profile.model,
+                    "provenance": section_provenance,
+                    "group_index": index,
+                    "groups": len(groups),
+                    "source_bundles": len(group),
+                },
+            )
             section_texts.append(section)
             _usage(course_dir, f"final-section:{index}", client.profile, response)
+            _notify(
+                progress,
+                f"[final] 分段 {index}/{len(groups)} 完成，用时 {time.monotonic() - started:.1f} 秒",
+            )
         merge_text = (
             f"Course title: {config['title']}\n"
             f"Output language: {config['output_language']}\n\n"
             + "\n\n---\n\n".join(section_texts)
         )
+        _notify(progress, f"[final] 等待 {_profile_label(client.profile)} 合并最终笔记...")
+        started = time.monotonic()
         response = _request_response(
             course_dir,
             stage="final-merge",
@@ -812,6 +924,7 @@ def finalize_course(
         )
         markdown = response_text(response)
         _usage(course_dir, "final-merge", client.profile, response)
+        _notify(progress, f"[final] 合并完成，用时 {time.monotonic() - started:.1f} 秒")
     link_count = 0
     if configured_web_url:
         markdown, link_count = link_markdown_timestamps(

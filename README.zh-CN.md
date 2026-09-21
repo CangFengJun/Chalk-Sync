@@ -136,6 +136,18 @@ courses/prompt-engineering/inbox/
   --web-video-url "https://www.bilibili.com/video/BV1CQt365EzW/"
 ```
 
+命令会即时显示当前阶段、分块进度和单次模型调用耗时；长时间抽帧或等待 API 时也会先打印状态：
+
+```text
+[prepare] 解析字幕完成：2218 条
+[frames] 正在分析 PPT 区域：右侧投影...
+[worker] 2/20 完成，用时 48.0 秒
+[worker] 3/20 等待 DeepSeek (deepseek-flash) 响应...
+[final] 等待 GPT (gpt-5.6-sol) 生成最终笔记...
+```
+
+重新执行命令时，已通过 provenance 校验的缓存也会逐项显示为“使用已有结果”。
+
 也可以自由组合：
 
 ```bash
@@ -181,7 +193,7 @@ ChalkSync 不会在 provider 失败时自动切换到另一个 provider，也不
 
 ## 六、续跑、切换与 `--force`
 
-每个 worker 分段独立保存；中断后用相同命令重跑，匹配的结果会被复用。
+每个 worker 分段和 Final 分段草稿都会独立保存；中断后用相同命令及相同参数重跑，匹配的结果会被复用。Final 分段保存在 `notes/sections/section-*.md`，对应的 `.manifest.json` 用于校验模型、输入和 prompt provenance。若最终合并失败，重跑会复用全部已完成分段，只重试合并。
 
 - 只切换 Final Profile：保留媒体、布局、分段和 worker 结果；给 `finalize` 使用 `--force`。
 - 切换 Worker Profile：保留输入视频、字幕和准备阶段整帧；给 `worker` 使用 `--force`，随后给 `finalize` 使用 `--force`。
@@ -216,6 +228,7 @@ courses/prompt-engineering/
 ├── chunks/chunks.json             worker 输入分段
 ├── worker/chunk-*.json            worker 结构化结果
 ├── state/                         用量、Batch 状态和非敏感错误信息
+├── notes/sections/                可断点续跑的 Final 分段与 manifest
 ├── notes/course.md                最终课程笔记
 ├── notes/manifest.json            最终 provenance
 └── viewer/index.html              本地播放器
@@ -260,6 +273,18 @@ courses/prompt-engineering/
 ### 缓存 provenance 不匹配
 
 确认确实希望按当前 profile 重新付费生成，然后对相应阶段添加 `--force`。不要删除 provenance 字段绕过检查。
+
+### Final 返回 HTTP 524
+
+这通常表示第三方网关等待模型响应超时。不要添加 `--force`；直接重跑会复用全部 Worker 结果和已经完成的 Final 分段。若同一分段反复超时，可减小单次 Final 输入，例如：
+
+```bash
+./scripts/chalksync-profile run courses/prompt-engineering \
+  --max-source-characters 60000 \
+  --web-video-url "https://www.bilibili.com/video/BV1CQt365EzW/"
+```
+
+更小的数值会产生更多、但更短的 Final 请求。续跑时必须继续使用相同数值，否则分段方式和 provenance 会改变。
 
 ### DeepSeek Batch 被拒绝
 

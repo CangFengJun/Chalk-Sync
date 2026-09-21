@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import http.client
 import json
 import os
 import subprocess
@@ -211,6 +212,68 @@ class PipelineTests(unittest.TestCase):
         self.assertLessEqual(region["y"] + region["height"], 1)
         self.assertEqual(region["confidence"], 1)
 
+    def test_final_sections_resume_after_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            course = Path(temporary) / "course"
+            init_course(course, title="Resume Test")
+            chunks = [
+                {
+                    "id": f"chunk-{index:04d}",
+                    "start_label": f"00:0{index - 1}:00",
+                    "end_label": f"00:0{index}:00",
+                    "transcript": f"Evidence {index}",
+                }
+                for index in (1, 2)
+            ]
+            chunks_dir = course / "chunks"
+            chunks_dir.mkdir()
+            (chunks_dir / "chunks.json").write_text(
+                json.dumps(chunks), encoding="utf-8"
+            )
+            worker_dir = course / "worker"
+            worker_dir.mkdir()
+            for chunk in chunks:
+                (worker_dir / f"{chunk['id']}.json").write_text(
+                    json.dumps({"analysis": {"summary": chunk["transcript"]}}),
+                    encoding="utf-8",
+                )
+
+            client = ResponsesClient(model_profile())
+            first_responses = [
+                {"output_text": "Section one", "usage": {}},
+                ResponsesAPIError("gateway timeout"),
+            ]
+            with patch(
+                "chalksync.pipeline._request_response", side_effect=first_responses
+            ):
+                with self.assertRaisesRegex(ResponsesAPIError, "gateway timeout"):
+                    finalize_course(
+                        course, client=client, max_source_characters=1
+                    )
+
+            progress: list[str] = []
+            resumed_responses = [
+                {"output_text": "Section two", "usage": {}},
+                {"output_text": "Merged notes", "usage": {}},
+            ]
+            with patch(
+                "chalksync.pipeline._request_response",
+                side_effect=resumed_responses,
+            ) as request:
+                notes = finalize_course(
+                    course,
+                    client=client,
+                    max_source_characters=1,
+                    progress=progress.append,
+                )
+
+            self.assertEqual(request.call_count, 2)
+            self.assertEqual(notes.read_text(encoding="utf-8"), "Merged notes\n")
+            self.assertIn("[final] 分段 1/2 使用已有结果", progress)
+            self.assertTrue(
+                (course / "notes" / "sections" / "section-001.manifest.json").is_file()
+            )
+
     def test_frame_selection_balances_board_and_slides(self) -> None:
         frames = [
             {"time": value, "path": f"b{value}", "region_kind": "board"}
@@ -382,10 +445,20 @@ class PipelineTests(unittest.TestCase):
                 with patch("chalksync.pipeline.probe_media", return_value=fake_media), patch(
                     "chalksync.pipeline.extract_frames", side_effect=fake_extract_frames
                 ):
-                    prepare_course(course)
-                    run_workers_sync(course, client=ResponsesClient(ds))
-                notes = finalize_course(course, client=ResponsesClient(gpt))
+                    progress: list[str] = []
+                    prepare_course(course, progress=progress.append)
+                    run_workers_sync(
+                        course, client=ResponsesClient(ds), progress=progress.append
+                    )
+                notes = finalize_course(
+                    course, client=ResponsesClient(gpt), progress=progress.append
+                )
                 self.assertIn("Verified", notes.read_text(encoding="utf-8"))
+                self.assertTrue(any(line.startswith("[prepare]") for line in progress))
+                self.assertTrue(any("[frames]" in line for line in progress))
+                self.assertTrue(any("[worker] 1/1 等待" in line for line in progress))
+                self.assertTrue(any("[worker] 1/1 完成" in line for line in progress))
+                self.assertTrue(any(line.startswith("[final]") for line in progress))
         finally:
             server.shutdown()
             server.server_close()
@@ -437,6 +510,25 @@ class ProfileTests(unittest.TestCase):
 
 
 class ResponsesAPITests(unittest.TestCase):
+    def test_remote_disconnect_is_retried_and_wrapped(self) -> None:
+        client = ResponsesClient(model_profile())
+        response = MagicMock()
+        response.__enter__.return_value.read.return_value = b"{}"
+        with patch(
+            "chalksync.openai_api.urllib.request.urlopen",
+            side_effect=[http.client.RemoteDisconnected(), response],
+        ) as urlopen, patch("chalksync.openai_api.time.sleep"):
+            self.assertEqual(client._request("GET", "/models", retries=1), b"{}")
+        self.assertEqual(urlopen.call_count, 2)
+
+        with patch(
+            "chalksync.openai_api.urllib.request.urlopen",
+            side_effect=http.client.RemoteDisconnected(),
+        ), patch("chalksync.openai_api.time.sleep"):
+            with self.assertRaisesRegex(ResponsesAPIError, "request failed") as raised:
+                client._request("GET", "/models", retries=1)
+        self.assertEqual(raised.exception.safe_message, "Responses endpoint request failed")
+
     def test_payload_uses_instructions_reasoning_and_json_mode(self) -> None:
         profile = model_profile()
         payload = response_payload(

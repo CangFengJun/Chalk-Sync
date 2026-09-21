@@ -71,6 +71,18 @@ Run the default `ds/gpt` pipeline:
   --web-video-url "https://www.bilibili.com/video/BV1CQt365EzW/"
 ```
 
+The command prints each stage, chunk progress, and model-call duration immediately, including status before long frame scans or API waits:
+
+```text
+[prepare] 解析字幕完成：2218 条
+[frames] 正在分析 PPT 区域：右侧投影...
+[worker] 2/20 完成，用时 48.0 秒
+[worker] 3/20 等待 DeepSeek (deepseek-flash) 响应...
+[final] 等待 GPT (gpt-5.6-sol) 生成最终笔记...
+```
+
+On resumed runs, provenance-validated Worker chunks and Final section drafts are reported as reused. If a long Final request returns HTTP 524, rerun with the same arguments to continue, or reduce each request with `--max-source-characters 60000`; do not add `--force` when the goal is to resume.
+
 Choose either profile per stage:
 
 ```bash

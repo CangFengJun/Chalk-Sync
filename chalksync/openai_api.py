@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import http.client
 import json
 import math
 import mimetypes
@@ -58,14 +59,19 @@ class ResponsesClient:
                     return response.read()
             except urllib.error.HTTPError as exc:
                 exc.read()
-                if exc.code in {408, 409, 429, 500, 502, 503, 504} and attempt < retries:
+                if exc.code in {408, 409, 429, 500, 502, 503, 504, 524} and attempt < retries:
                     time.sleep(2**attempt)
                     continue
                 raise ResponsesAPIError(
                     f"{self.profile.name} Responses endpoint returned HTTP {exc.code}",
                     safe_message=f"Responses endpoint returned HTTP {exc.code}",
                 ) from exc
-            except urllib.error.URLError as exc:
+            except (
+                urllib.error.URLError,
+                http.client.RemoteDisconnected,
+                ConnectionError,
+                TimeoutError,
+            ) as exc:
                 if attempt < retries:
                     time.sleep(2**attempt)
                     continue
